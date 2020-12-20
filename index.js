@@ -1,6 +1,15 @@
 const fs = require('fs');
 const readline = require('readline');
 const {google} = require('googleapis');
+const request = require('request');
+
+
+// Campaign Monitor add subscriber endpoint
+fs.readFile('campaign-monitor-keys.json', (err, keys) => {
+  let keysJson = JSON.parse(keys);
+  const LIST_ID = keysJson.list_id;
+  const API_KEY = keysJson.api_key;
+});
 
 // If modifying these scopes, delete token.json.
 const SCOPES = ['https://www.googleapis.com/auth/contacts.readonly'];
@@ -13,8 +22,10 @@ const TOKEN_PATH = 'token.json';
 fs.readFile('credentials.json', (err, content) => {
   if (err) return console.log('Error loading client secret file:', err);
   // Authorize a client with credentials, then call the Google Tasks API.
-  authorize(JSON.parse(content), listConnectionNames);
+  authorize(JSON.parse(content), getRecentConnections);
 });
+
+// maybe do a promise all for both fs.readfile instances
 
 /**
  * Create an OAuth2 client with the given credentials, and then execute the
@@ -23,9 +34,9 @@ fs.readFile('credentials.json', (err, content) => {
  * @param {function} callback The callback to call with the authorized client.
  */
 function authorize(credentials, callback) {
-  const {client_secret, client_id, redirect_uris} = credentials.installed;
+  //const {client_secret, client_id, redirect_uris} = credentials.installed;
   const oAuth2Client = new google.auth.OAuth2(
-      client_secret, client_id, redirect_uris[0]);
+      credentials.web.client_id, credentials.web.client_secret, "https://stonedigital.com.au");
 
   // Check if we have previously stored a token.
   fs.readFile(TOKEN_PATH, (err, token) => {
@@ -67,30 +78,148 @@ function getNewToken(oAuth2Client, callback) {
 }
 
 /**
- * Print the display name if available for 10 connections.
+ * List connections by most recent.
+ * For those less than 24 hrs old, add them to subscription list.
  *
  * @param {google.auth.OAuth2} auth An authorized OAuth2 client.
  */
-function listConnectionNames(auth) {
+function getRecentConnections(auth) {
+
   const service = google.people({version: 'v1', auth});
+
   service.people.connections.list({
     resourceName: 'people/me',
     pageSize: 10,
-    personFields: 'names,emailAddresses',
+    personFields: 'names,emailAddresses,events,metadata',
+    sortOrder:"LAST_MODIFIED_DESCENDING"
   }, (err, res) => {
     if (err) return console.error('The API returned an error: ' + err);
+
     const connections = res.data.connections;
     if (connections) {
-      console.log('Connections:');
       connections.forEach((person) => {
         if (person.names && person.names.length > 0) {
-          console.log(person.names[0].displayName);
+          let sourcesArray = person.metadata.sources;
+          sourcesArray.forEach((source) => {
+            if(source.type == 'CONTACT' && lessThan1DayAgo(source.updateTime)) {
+              let displayName = person.names[0].displayName;
+              let emailAddress = person.emailAddresses[0].value;
+              console.log(displayName);
+              console.log(emailAddress);
+              console.log(source.updateTime);
+
+              checkSubscriptionStatus(emailAddress, displayName)
+                .then(res => {
+                  console.log(res);
+                  if(res.status == "203") {
+                    addSubscriber(res.data);
+                  };
+                })
+                .catch(err => console.log(err));
+
+            }
+
+          });
+
         } else {
           console.log('No display name found for connection.');
         }
+
       });
+
     } else {
       console.log('No connections found.');
     }
   });
 }
+
+function lessThan1DayAgo(updateTime){
+  let d = new Date();
+  let updateDate = new Date(updateTime);
+  let diffInSeconds = (d.getTime() - updateDate.getTime())/1000;
+  console.log(diffInSeconds);
+  if(diffInSeconds < 60*60*24){
+    return true;
+  }
+  else {
+    return false;
+  }
+}
+
+function checkSubscriptionStatus(emailAddress, displayName){
+
+  let options = {
+    url: "https://api.createsend.com/api/v3.2/subscribers/" + LIST_ID + ".json?email=" + emailAddress + "&includetrackingpreference=true",
+    auth: {
+      bearer: API_KEY
+    }
+  };
+
+  new Promise((resolve, reject) => {
+
+    request(options, (error, response, body) => {
+
+      if(error) {
+        reject(error);
+      }
+      if(response == "203") {
+        console.log("Subscriber Not In List");
+
+        let dataObject = {
+          status: "203",
+          body: body,
+          data: {
+            email: emailAddress,
+            name: displayName
+          }
+        };
+
+        resolve(dataObject);
+      }
+      else {
+        resolve(response, body);
+      }
+
+    });
+
+  });
+
+}
+function addSubscriber(dataObject){
+
+  let requestBody = {
+    "EmailAddress": dataObject.email,
+    "Name": dataObject.name,
+    "CustomFields": [
+      {
+        "Key": "Source",
+        "Value": "Google Contacts"
+      }
+    ],
+    "Resubscribe": true,
+    "RestartSubscriptionBasedAutoresponders": true,
+    "ConsentToTrack":"Yes"
+  };
+
+  let options = {
+    url: "https://api.createsend.com/api/v3.2/subscribers/" + LIST_ID + ".json",
+    method: "POST",
+    auth: {
+      bearer: API_KEY
+    }
+    body: requestBody
+  };
+
+  request(options, (error, response, body) => {
+    if(error) { reject(error); }
+    if(response == "201") {
+      console.log("success!")
+    }
+    else {
+      console.log(response, body);
+    }
+  });
+
+}
+
+
