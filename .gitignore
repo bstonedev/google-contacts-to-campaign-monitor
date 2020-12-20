@@ -5,3 +5,4 @@ test/*
 npm-debug.log
 .DS_Store
 .env
+campaign-monitor-keys.json
