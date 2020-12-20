@@ -2,14 +2,9 @@ const fs = require('fs');
 const readline = require('readline');
 const {google} = require('googleapis');
 const request = require('request');
-
-
-// Campaign Monitor add subscriber endpoint
-fs.readFile('campaign-monitor-keys.json', (err, keys) => {
-  let keysJson = JSON.parse(keys);
-  const LIST_ID = keysJson.list_id;
-  const API_KEY = keysJson.api_key;
-});
+const requestPromise = require('request-promise');
+const httpsProxyAgent = require('https-proxy-agent');
+const schedule = require('node-schedule');
 
 // If modifying these scopes, delete token.json.
 const SCOPES = ['https://www.googleapis.com/auth/contacts.readonly'];
@@ -18,14 +13,47 @@ const SCOPES = ['https://www.googleapis.com/auth/contacts.readonly'];
 // time.
 const TOKEN_PATH = 'token.json';
 
-// Load client secrets from a local file.
-fs.readFile('credentials.json', (err, content) => {
-  if (err) return console.log('Error loading client secret file:', err);
-  // Authorize a client with credentials, then call the Google Tasks API.
-  authorize(JSON.parse(content), getRecentConnections);
-});
+let LIST_ID;
+let API_KEY;
+let BASIC_AUTH_KEY;
 
-// maybe do a promise all for both fs.readfile instances
+// Run initApp() 4x each day
+let rule = new schedule.RecurrenceRule();
+rule.hour = new schedule.Range(0, 23, 4);
+// FOR TESTING
+// rule.minute = new schedule.Range(0, 59, 1);
+initApp();
+schedule.scheduleJob(rule, initApp)
+
+// Get all credentials then run authorize() function
+function initApp(){
+
+  let filesToRead = ['credentials.json', 'campaign-monitor-key.json'];
+  let promisesArray = []
+  for (let i = 0; i < filesToRead.length; i++) {
+    promisesArray.push(
+      new Promise((resolve, reject) => {
+        fs.readFile(filesToRead[i], (err, data) => {
+          if(err){ reject(err) }
+          else{ resolve(JSON.parse(data)) }
+        });
+      })
+    );
+  }
+
+  Promise.all(promisesArray)
+  .then(credentials => {
+
+    // Authorize a client with credentials, then call the Google Tasks API.
+    authorize(credentials[0], getRecentConnections);
+    LIST_ID = credentials[1].list_id;
+    API_KEY = credentials[1].api_key;
+    BASIC_AUTH_KEY = Buffer.from(API_KEY + ":x").toString("base64");
+
+  })
+  .catch(err => console.log(err));
+
+}
 
 /**
  * Create an OAuth2 client with the given credentials, and then execute the
@@ -36,7 +64,7 @@ fs.readFile('credentials.json', (err, content) => {
 function authorize(credentials, callback) {
   //const {client_secret, client_id, redirect_uris} = credentials.installed;
   const oAuth2Client = new google.auth.OAuth2(
-      credentials.web.client_id, credentials.web.client_secret, "https://stonedigital.com.au");
+      credentials.web.client_id, credentials.web.client_secret, credentials.web.redirect_uris[0]);
 
   // Check if we have previously stored a token.
   fs.readFile(TOKEN_PATH, (err, token) => {
@@ -85,6 +113,7 @@ function getNewToken(oAuth2Client, callback) {
  */
 function getRecentConnections(auth) {
 
+  console.log(LIST_ID);
   const service = google.people({version: 'v1', auth});
 
   service.people.connections.list({
@@ -108,14 +137,18 @@ function getRecentConnections(auth) {
               console.log(emailAddress);
               console.log(source.updateTime);
 
+              
               checkSubscriptionStatus(emailAddress, displayName)
                 .then(res => {
+                  console.log("then after checkSubscriptionStatus");
                   console.log(res);
-                  if(res.status == "203") {
-                    addSubscriber(res.data);
+                  if(res.Code == "203") {
+                    console.log("wooo success");
+                    addSubscriber(res.Data);
                   };
                 })
                 .catch(err => console.log(err));
+                
 
             }
 
@@ -148,36 +181,30 @@ function lessThan1DayAgo(updateTime){
 
 function checkSubscriptionStatus(emailAddress, displayName){
 
-  let options = {
-    url: "https://api.createsend.com/api/v3.2/subscribers/" + LIST_ID + ".json?email=" + emailAddress + "&includetrackingpreference=true",
-    auth: {
-      bearer: API_KEY
-    }
-  };
+  return new Promise((resolve, reject) => {
 
-  new Promise((resolve, reject) => {
+    let options = {
+      url: "https://api.createsend.com/api/v3.2/subscribers/" + LIST_ID + ".json?email=" + emailAddress + "&includetrackingpreference=true",
+      headers: {
+        "Host": "api.createsend.com",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": "Basic " + BASIC_AUTH_KEY
+      }
+    };
 
     request(options, (error, response, body) => {
 
       if(error) {
-        reject(error);
-      }
-      if(response == "203") {
-        console.log("Subscriber Not In List");
-
-        let dataObject = {
-          status: "203",
-          body: body,
-          data: {
-            email: emailAddress,
-            name: displayName
-          }
-        };
-
-        resolve(dataObject);
+        reject("THIS WAS ERROR");
       }
       else {
-        resolve(response, body);
+        let dataObject = JSON.parse(body);
+        dataObject.Data = {};
+        dataObject.Data.Email = emailAddress;
+        dataObject.Data.Name = displayName;
+        dataObject.StatusCode = response.statusCode;
+        resolve(dataObject);
       }
 
     });
@@ -188,35 +215,41 @@ function checkSubscriptionStatus(emailAddress, displayName){
 function addSubscriber(dataObject){
 
   let requestBody = {
-    "EmailAddress": dataObject.email,
-    "Name": dataObject.name,
-    "CustomFields": [
-      {
+    "EmailAddress": dataObject.Email,
+    "Name": dataObject.Name,
+    "CustomFields": [{
         "Key": "Source",
         "Value": "Google Contacts"
-      }
-    ],
+    }],
     "Resubscribe": true,
     "RestartSubscriptionBasedAutoresponders": true,
     "ConsentToTrack":"Yes"
   };
+  console.log(requestBody);
 
   let options = {
     url: "https://api.createsend.com/api/v3.2/subscribers/" + LIST_ID + ".json",
     method: "POST",
-    auth: {
-      bearer: API_KEY
-    }
-    body: requestBody
+    headers: {
+      "Host": "api.createsend.com",
+      "content-type": "application/json",
+      "Accept": "application/json",
+      "Authorization": "Basic " + BASIC_AUTH_KEY
+    },
+    body: requestBody,
+    json: true
   };
 
   request(options, (error, response, body) => {
-    if(error) { reject(error); }
-    if(response == "201") {
-      console.log("success!")
-    }
+    if(error) { console.log(error); }
     else {
-      console.log(response, body);
+      console.log(response.statusCode);
+      if(response.statusCode == "201") {
+        console.log("wooh, added this email successfully", body);
+      }
+      else {
+        console.log("error in adding email: ", body);
+      }
     }
   });
 
